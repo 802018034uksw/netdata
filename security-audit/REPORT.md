@@ -7,36 +7,35 @@
 
 ---
 
-## Finding #1: Integer Overflow in Streaming DIMENSION Slot → Heap Buffer Overflow → Remote Code Execution
+## Finding #1: Integer Overflow in Streaming DIMENSION Slot → Heap Buffer Overflow (RCE potential / DoS proven)
 
 ### Summary
 
-A malicious or compromised streaming child agent can send a crafted `DIMENSION SLOT:<value>` command with a 64-bit slot value that causes an integer overflow in the parent's dimension-cache allocation. This results in:
+A malicious or compromised streaming child agent can send a crafted `DIMENSION SLOT:<value>` command with a 64-bit slot value that causes an integer overflow in the parent's dimension-cache allocation. Validated impacts:
 
-1. **Remote Code Execution** (proven): A function pointer in an adjacent heap object is overwritten with an attacker-controlled value, redirecting execution to arbitrary code. PoC demonstrates `system("uname -n")` + `system("id")` running as `uid=0(root)`.
-2. **Heap buffer overflow** (CWE-787): A tiny buffer is allocated but treated as enormous, enabling out-of-bounds writes at attacker-chosen offsets.
-3. **Remote Denial of Service** (guaranteed): A moderately large slot value triggers a multi-gigabyte allocation that fails, calling `fatal()` which terminates the entire parent agent process.
+1. **Authenticated remote heap buffer overflow** (CWE-787, proven): A tiny buffer is allocated but treated as enormous, enabling out-of-bounds heap writes. Confirmed with AddressSanitizer.
+2. **Authenticated remote Denial of Service** (proven, guaranteed): A moderately large slot value triggers a multi-gigabyte allocation that fails, calling `fatal()` which terminates the entire parent agent process. Alternatively, the overflow's wild write causes an immediate SIGSEGV.
+3. **Adjacent heap-object corruption** (proven in local model): A standalone harness demonstrates that the overflow zeroes/overwrites fields of neighboring heap objects, including function pointers.
+4. **Plausible RCE potential** (not proven end-to-end): All ingredients for code execution exist (controlled write offset, partially-controlled write content, heap objects with function pointers), but remote exploitation of a running Netdata binary was NOT demonstrated.
+
+**Important distinction:** The standalone PoCs (`poc_rce_chain.c`, `poc_rce_primitive.c`) demonstrate the write primitive and callback hijack within their own process. They do NOT prove remote code execution against a live Netdata parent. The `uid=0(root)` output only reflects the PoC process's own privilege level, not a remotely-hijacked agent.
 
 ### Severity
 
-**CRITICAL** (CVSS 3.1 Base: 9.0)
+**CRITICAL** (CVSS 3.1 Base: 8.1 — High)
 
 - Attack Vector: Network (streaming protocol, TCP port 19999)
-- Attack Complexity: Low (requires valid streaming API key; standard in parent-child deployments)
-- Privileges Required: Low (valid streaming child credentials)
+- Attack Complexity: **High** (RCE requires heap grooming, timing, ASLR; DoS is Low complexity)
+- Privileges Required: Low (valid streaming API key; standard in parent-child deployments)
 - User Interaction: None
 - Scope: Unchanged
-- Confidentiality: High (arbitrary code execution as the netdata user)
-- Integrity: High (arbitrary code execution)
+- Confidentiality: High (potential — heap corruption may leak or allow arbitrary code)
+- Integrity: High (potential — controlled heap write at chosen offset)
 - Availability: High (guaranteed process termination via DoS variant)
 
-**RCE is proven end-to-end** — the chain PoC (`poc_rce_chain.c`) demonstrates:
-1. Integer overflow → 48-byte allocation with `arr->size = 7.7×10^17`
-2. Heap grooming → victim object placed at entries[2]
-3. Controlled OOB write → victim's function pointer overwritten
-4. Callback dispatch → `system("uname -n")` executes as `uid=0(root)`
+**Note on RCE:** The standalone PoCs prove the write-primitive and function-pointer-hijack mechanism works in a controlled heap layout. They do NOT constitute a remote exploit against a running Netdata binary. Full RCE would additionally require: (a) heap grooming via streaming commands against glibc's allocator, (b) surviving or bypassing the init-loop crash, (c) targeting a real callback structure at a predictable offset. These are plausible but undemonstrated steps.
 
-See **Proof of Concept** section for full output.
+**Proven impact:** Authenticated remote DoS (single packet, guaranteed) + authenticated remote heap-buffer-overflow with attacker-controlled write offset.
 
 ### Affected Code
 
@@ -137,52 +136,32 @@ $ gcc -O0 -g -o poc2 poc_heap_corruption.c && ./poc2 0xaaaaaaaaaaaaaab
 [+] HEAP CORRUPTION CONFIRMED: adjacent object fully zeroed by the overflow.
 ```
 
-**3. Full RCE chain — function pointer hijack → command execution (poc_rce_chain.c):**
+**3. Write primitive + callback hijack in standalone harness (poc_rce_chain.c):**
 
-The complete exploitation chain in one program. After the overflow creates `arr->size = 7.7×10^17`, the code's bounds check (`slot <= arr->size`) passes for ANY small slot value. The attacker targets entries[2] which overlaps a victim object's function pointer:
+This PoC demonstrates the *mechanism* by which the overflow could lead to RCE. It runs entirely within its own process (NOT against a live Netdata agent). It shows:
+- The overflow creates a 48-byte chunk with `arr->size = 7.7×10^17`
+- The bounds check passes for any small slot value
+- An adjacent object's function pointer is overwritten via the OOB write
+- Calling the corrupted pointer redirects execution
+
+**What this proves:** The write primitive works and CAN overwrite function pointers.
+**What this does NOT prove:** That this can be achieved remotely against a running Netdata parent with ASLR, real allocator behavior, and thread timing.
 
 ```
 $ gcc -O0 -g -o poc_rce_chain poc_rce_chain.c && ./poc_rce_chain
-================================================================
- NETDATA DIMENSION SLOT: Integer Overflow -> RCE
-================================================================
-
-[STEP 1] Integer Overflow — Create undersized PRD_ARRAY
-  Attacker slot value:    0x0aaaaaaaaaaaaaac
-  slot * 24 mod 2^64:     32 bytes
-  callocz allocation:     48 bytes
-  Logical arr->size:      768614336404564652 entries
-
-[STEP 2] Heap Grooming — Allocate victim object after array
-  victim @ 0x...2e0 (callback = legitimate_callback)
-
-[STEP 3] Compute targeting slot
-  byte offset     = 48
-  target_slot     = 3
-  target_slot <= arr->size (768614336404564652)? YES -> write proceeds
-
-[STEP 4] Controlled Out-of-Bounds Write
-  Write target address: 0x...2e0
-  (this is 64 bytes past the 48-byte allocation!)
-
-[STEP 5] Check victim state & trigger hijacked callback
-  victim->callback OVERWRITTEN: 0x40132d -> 0x401196
+[STEP 1] callocz allocation: 48 bytes, Logical arr->size: 768614336404564652
+[STEP 3] target_slot = 3, target_slot <= arr->size? YES -> write proceeds
+[STEP 4] Write target: 64 bytes past the 48-byte allocation (OOB!)
+[STEP 5] victim->callback OVERWRITTEN
   >>> Calling victim->callback() (HIJACKED) <<<
-
-  +----------------------------------------------------+
-  |  *** ATTACKER CODE EXECUTED (RCE PROVEN) ***        |
-  +----------------------------------------------------+
-  | Running: uname -n (hostname)
-  | Output:  ip-10-147-162-130.us-east-1.compute.internal
-  +----------------------------------------------------+
+  | Running: uname -n
   | Running: id
-  | Output:  uid=0(root) gid=0(root) groups=0(root)
-  +----------------------------------------------------+
+  | uid=0(root) — NOTE: this is the PoC process's own privilege, not a remote exploit
 ```
 
-**Exploitation mechanism (refined):** The overflow gives the array an enormous logical size (`arr->size = 7.7×10^17`). Because the bounds check in the "update slot entry" branch (line ~234) is `slot >= 1 && (size_t)slot <= current_arr->size`, it passes for any small slot. The attacker does NOT need to survive the init loop — they only need the overflow to SET `arr->size` once. After that, any DIMENSION with a small slot (e.g., 3) on the SAME chart skips the grow path entirely (since `wanted_size <= current_size`) and proceeds to write `prd->rda`, `prd->rd`, `prd->id` at the chosen offset. With heap grooming, a victim object sits there.
+**4. Standalone function pointer hijack (poc_rce_primitive.c):**
 
-**4. Legacy PoC — standalone function pointer hijack (poc_rce_primitive.c):**
+Same mechanism as poc_rce_chain.c in a simpler form. Demonstrates the primitive in isolation.
 
 ```
 $ gcc -O0 -g -o poc3 poc_rce_primitive.c && ./poc3
@@ -198,7 +177,7 @@ $ gcc -O0 -g -o poc3 poc_rce_primitive.c && ./poc3
 [+] This proves the DIMENSION SLOT overflow enables RCE.
 ```
 
-**Exploitation mechanism:** After the first DIMENSION creates the overflowed array (huge `arr->size`), subsequent DIMENSION calls with small slot values skip the init loop (since `wanted_size <= current_size`) and proceed directly to the `entries[slot-1]` write, which writes `prd->rda` (heap pointer), `prd->rd` (heap pointer), and `prd->id` (pointer to attacker-controlled dimension name string) at a deterministic offset from the undersized chunk. With heap grooming, the attacker positions a target object (containing a function pointer or vtable) at that offset. The written `prd->id` value points to the attacker's dimension name string — which can be crafted to contain a valid code address on architectures without pointer authentication.
+**Write primitive mechanism:** After the overflow, `arr->size` is enormous. The bounds check in the "update slot entry" branch (line ~234: `slot >= 1 && (size_t)slot <= current_arr->size`) passes for any small slot. The code writes `prd->rda` (heap pointer), `prd->rd` (heap pointer), and `prd->id` (pointer to dimension name string — attacker-controlled content) at the chosen offset from the undersized chunk. In the standalone model, this overwrites an adjacent object's function pointer. Whether this is achievable against the live agent's allocator and thread model remains undemonstrated.
 
 **4. Network-level:** See `poc_stream_dimension_slot.py` — connects as a streaming child and sends the crafted DIMENSION command.
 
@@ -367,7 +346,7 @@ Add a NULL check: `if(!keyword) return PARSER_RC_ERROR;` before the `strcmp` cal
 
 | File | Description |
 |------|-------------|
-| `security-audit/poc_rce_chain.c` | **Full RCE chain: overflow → heap groom → callback hijack → `system("uname -n")` as root** |
+| `security-audit/poc_rce_chain.c` | Write primitive + callback hijack in standalone harness (demonstrates mechanism, NOT remote exploit) |
 | `security-audit/poc_prd_overflow.c` | ASan PoC: heap-buffer-overflow on first OOB write |
 | `security-audit/poc_heap_corruption.c` | Proves adjacent heap object zeroed (fnptr/magic) |
 | `security-audit/poc_rce_primitive.c` | Function pointer hijack → attacker code execution |
